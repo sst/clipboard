@@ -8,112 +8,256 @@
 
 package clipboard
 
-/*
-#cgo CFLAGS: -x objective-c
-#cgo LDFLAGS: -framework Foundation -framework Cocoa
-#import <Foundation/Foundation.h>
-#import <Cocoa/Cocoa.h>
-
-unsigned int clipboard_read_string(void **out);
-unsigned int clipboard_read_image(void **out);
-int clipboard_write_string(const void *bytes, NSInteger n);
-int clipboard_write_image(const void *bytes, NSInteger n);
-NSInteger clipboard_change_count();
-*/
-import "C"
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
-	"unsafe"
+)
+
+var (
+	lastChangeCount int64
+	changeCountMu   sync.Mutex
 )
 
 func initialize() error { return nil }
 
 func read(t Format) (buf []byte, err error) {
-	var (
-		data unsafe.Pointer
-		n    C.uint
-	)
 	switch t {
 	case FmtText:
-		n = C.clipboard_read_string(&data)
+		return readText()
 	case FmtImage:
-		n = C.clipboard_read_image(&data)
+		return readImage()
+	default:
+		return nil, errUnsupported
 	}
-	if data == nil {
+}
+
+func readText() ([]byte, error) {
+	// Check if clipboard contains string data
+	checkScript := `
+	try
+		set clipboardTypes to (clipboard info)
+		repeat with aType in clipboardTypes
+			if (first item of aType) is string then
+				return "hastext"
+			end if
+		end repeat
+		return "notext"
+	on error
+		return "error"
+	end try
+	`
+
+	cmd := exec.Command("osascript", "-e", checkScript)
+	checkOut, err := cmd.Output()
+	if err != nil {
 		return nil, errUnavailable
 	}
-	defer C.free(unsafe.Pointer(data))
-	if n == 0 {
+
+	checkOut = bytes.TrimSpace(checkOut)
+	if !bytes.Equal(checkOut, []byte("hastext")) {
+		return nil, errUnavailable
+	}
+
+	// Now get the actual text
+	cmd = exec.Command("osascript", "-e", "get the clipboard")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, errUnavailable
+	}
+	// Remove trailing newline that osascript adds
+	out = bytes.TrimSuffix(out, []byte("\n"))
+
+	// If clipboard was set to empty string, return nil
+	if len(out) == 0 {
 		return nil, nil
 	}
-	return C.GoBytes(data, C.int(n)), nil
+	return out, nil
+}
+func readImage() ([]byte, error) {
+	// AppleScript to read image data from clipboard as base64
+	script := `
+	try
+		set theData to the clipboard as «class PNGf»
+		return theData
+	on error
+		return ""
+	end try
+	`
+
+	cmd := exec.Command("osascript", "-e", script)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, errUnavailable
+	}
+
+	// Check if we got any data
+	out = bytes.TrimSpace(out)
+	if len(out) == 0 {
+		return nil, errUnavailable
+	}
+
+	// The output is in hex format (e.g., «data PNGf89504E...»)
+	// We need to extract and convert it
+	outStr := string(out)
+	if !strings.HasPrefix(outStr, "«data PNGf") || !strings.HasSuffix(outStr, "»") {
+		return nil, errUnavailable
+	}
+
+	// Extract hex data
+	hexData := strings.TrimPrefix(outStr, "«data PNGf")
+	hexData = strings.TrimSuffix(hexData, "»")
+
+	// Convert hex to bytes
+	buf := make([]byte, len(hexData)/2)
+	for i := 0; i < len(hexData); i += 2 {
+		b, err := strconv.ParseUint(hexData[i:i+2], 16, 8)
+		if err != nil {
+			return nil, errUnavailable
+		}
+		buf[i/2] = byte(b)
+	}
+
+	return buf, nil
 }
 
 // write writes the given data to clipboard and
 // returns true if success or false if failed.
 func write(t Format, buf []byte) (<-chan struct{}, error) {
-	var ok C.int
+	var err error
 	switch t {
 	case FmtText:
-		if len(buf) == 0 {
-			ok = C.clipboard_write_string(unsafe.Pointer(nil), 0)
-		} else {
-			ok = C.clipboard_write_string(unsafe.Pointer(&buf[0]),
-				C.NSInteger(len(buf)))
-		}
+		err = writeText(buf)
 	case FmtImage:
-		if len(buf) == 0 {
-			ok = C.clipboard_write_image(unsafe.Pointer(nil), 0)
-		} else {
-			ok = C.clipboard_write_image(unsafe.Pointer(&buf[0]),
-				C.NSInteger(len(buf)))
-		}
+		err = writeImage(buf)
 	default:
 		return nil, errUnsupported
 	}
-	if ok != 0 {
-		return nil, errUnavailable
+
+	if err != nil {
+		return nil, err
 	}
 
-	// use unbuffered data to prevent goroutine leak
+	// Update change count
+	changeCountMu.Lock()
+	lastChangeCount++
+	currentCount := lastChangeCount
+	changeCountMu.Unlock()
+
+	// use unbuffered channel to prevent goroutine leak
 	changed := make(chan struct{}, 1)
-	cnt := C.long(C.clipboard_change_count())
 	go func() {
 		for {
-			// not sure if we are too slow or the user too fast :)
 			time.Sleep(time.Second)
-			cur := C.long(C.clipboard_change_count())
-			if cnt != cur {
+			changeCountMu.Lock()
+			if lastChangeCount != currentCount {
+				changeCountMu.Unlock()
 				changed <- struct{}{}
 				close(changed)
 				return
 			}
+			changeCountMu.Unlock()
 		}
 	}()
 	return changed, nil
 }
 
+func writeText(buf []byte) error {
+	if len(buf) == 0 {
+		// Clear clipboard
+		script := `set the clipboard to ""`
+		cmd := exec.Command("osascript", "-e", script)
+		if err := cmd.Run(); err != nil {
+			return errUnavailable
+		}
+		return nil
+	}
+
+	// Escape the text for AppleScript
+	text := string(buf)
+	text = strings.ReplaceAll(text, "\\", "\\\\")
+	text = strings.ReplaceAll(text, "\"", "\\\"")
+
+	script := fmt.Sprintf(`set the clipboard to "%s"`, text)
+	cmd := exec.Command("osascript", "-e", script)
+	if err := cmd.Run(); err != nil {
+		return errUnavailable
+	}
+	return nil
+}
+func writeImage(buf []byte) error {
+	if len(buf) == 0 {
+		// Clear clipboard
+		script := `set the clipboard to ""`
+		cmd := exec.Command("osascript", "-e", script)
+		if err := cmd.Run(); err != nil {
+			return errUnavailable
+		}
+		return nil
+	}
+
+	// Create a temporary file to store the PNG data
+	tmpFile, err := os.CreateTemp("", "clipboard*.png")
+	if err != nil {
+		return errUnavailable
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(buf); err != nil {
+		tmpFile.Close()
+		return errUnavailable
+	}
+	tmpFile.Close()
+
+	// Use osascript to set clipboard to the image file
+	script := fmt.Sprintf(`
+	set theFile to POSIX file "%s"
+	set theImage to read theFile as «class PNGf»
+	set the clipboard to theImage
+	`, tmpFile.Name())
+
+	cmd := exec.Command("osascript", "-e", script)
+	if err := cmd.Run(); err != nil {
+		return errUnavailable
+	}
+	return nil
+}
 func watch(ctx context.Context, t Format) <-chan []byte {
 	recv := make(chan []byte, 1)
-	// not sure if we are too slow or the user too fast :)
 	ti := time.NewTicker(time.Second)
-	lastCount := C.long(C.clipboard_change_count())
+
+	// Get initial clipboard content
+	var lastContent []byte
+	if b := Read(t); b != nil {
+		lastContent = make([]byte, len(b))
+		copy(lastContent, b)
+	}
+
 	go func() {
+		defer close(recv)
+		defer ti.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
-				close(recv)
 				return
 			case <-ti.C:
-				this := C.long(C.clipboard_change_count())
-				if lastCount != this {
-					b := Read(t)
-					if b == nil {
-						continue
-					}
+				b := Read(t)
+				if b == nil {
+					continue
+				}
+
+				// Check if content changed
+				if !bytes.Equal(lastContent, b) {
 					recv <- b
-					lastCount = this
+					lastContent = make([]byte, len(b))
+					copy(lastContent, b)
 				}
 			}
 		}
