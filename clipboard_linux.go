@@ -8,155 +8,257 @@
 
 package clipboard
 
-/*
-#cgo LDFLAGS: -ldl
-#include <stdlib.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-
-int clipboard_test();
-int clipboard_write(
-	char*          typ,
-	unsigned char* buf,
-	size_t         n,
-	uintptr_t      handle
-);
-unsigned long clipboard_read(char* typ, char **out);
-*/
-import "C"
 import (
 	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"runtime"
-	"runtime/cgo"
+	"os/exec"
+	"strings"
+	"sync"
 	"time"
-	"unsafe"
 )
 
-var helpmsg = `%w: Failed to initialize the X11 display, and the clipboard package
-will not work properly. Install the following dependency may help:
+var (
+	// Clipboard tools in order of preference
+	clipboardTools = []struct {
+		name      string
+		readCmd   []string
+		writeCmd  []string
+		readImg   []string
+		writeImg  []string
+		available bool
+	}{
+		{
+			name:     "xclip",
+			readCmd:  []string{"xclip", "-selection", "clipboard", "-o"},
+			writeCmd: []string{"xclip", "-selection", "clipboard"},
+			readImg:  []string{"xclip", "-selection", "clipboard", "-t", "image/png", "-o"},
+			writeImg: []string{"xclip", "-selection", "clipboard", "-t", "image/png"},
+		},
+		{
+			name:     "xsel",
+			readCmd:  []string{"xsel", "--clipboard", "--output"},
+			writeCmd: []string{"xsel", "--clipboard", "--input"},
+			readImg:  []string{"xsel", "--clipboard", "--output"},
+			writeImg: []string{"xsel", "--clipboard", "--input"},
+		},
+		{
+			name:     "wl-clipboard",
+			readCmd:  []string{"wl-paste", "-n"},
+			writeCmd: []string{"wl-copy"},
+			readImg:  []string{"wl-paste", "-t", "image/png", "-n"},
+			writeImg: []string{"wl-copy", "-t", "image/png"},
+		},
+	}
 
-	apt install -y libx11-dev
-
-If the clipboard package is in an environment without a frame buffer,
-such as a cloud server, it may also be necessary to install xvfb:
-
-	apt install -y xvfb
-
-and initialize a virtual frame buffer:
-
-	Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
-	export DISPLAY=:99.0
-
-Then this package should be ready to use.
-`
+	selectedTool   int = -1
+	toolMutex      sync.Mutex
+	lastChangeTime time.Time
+	changeTimeMu   sync.Mutex
+)
 
 func initialize() error {
-	ok := C.clipboard_test()
-	if ok != 0 {
-		return fmt.Errorf(helpmsg, errUnavailable)
+	toolMutex.Lock()
+	defer toolMutex.Unlock()
+
+	if selectedTool >= 0 {
+		return nil // Already initialized
 	}
+
+	// Check which clipboard tool is available
+	for i, tool := range clipboardTools {
+		cmd := exec.Command("which", tool.name)
+		if err := cmd.Run(); err == nil {
+			clipboardTools[i].available = true
+			if selectedTool < 0 {
+				selectedTool = i
+			}
+		}
+	}
+
+	if selectedTool < 0 {
+		return fmt.Errorf(`%w: No clipboard utility found. Install one of the following:
+
+For X11 systems:
+	apt install -y xclip
+	# or
+	apt install -y xsel
+
+For Wayland systems:
+	apt install -y wl-clipboard
+
+If running in a headless environment, you may also need:
+	apt install -y xvfb
+	# and run:
+	Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+	export DISPLAY=:99.0`, errUnavailable)
+	}
+
 	return nil
 }
 
 func read(t Format) (buf []byte, err error) {
+	toolMutex.Lock()
+	tool := clipboardTools[selectedTool]
+	toolMutex.Unlock()
+
 	switch t {
 	case FmtText:
-		return readc("UTF8_STRING")
+		return readText(tool)
 	case FmtImage:
-		return readc("image/png")
-	}
-	return nil, errUnsupported
-}
-
-func readc(t string) ([]byte, error) {
-	ct := C.CString(t)
-	defer C.free(unsafe.Pointer(ct))
-
-	var data *C.char
-	n := C.clipboard_read(ct, &data)
-	switch C.long(n) {
-	case -1:
-		return nil, errUnavailable
-	case -2:
+		return readImage(tool)
+	default:
 		return nil, errUnsupported
 	}
-	if data == nil {
-		return nil, errUnavailable
-	}
-	defer C.free(unsafe.Pointer(data))
-	switch {
-	case n == 0:
-		return nil, nil
-	default:
-		return C.GoBytes(unsafe.Pointer(data), C.int(n)), nil
-	}
 }
 
-// write writes the given data to clipboard and
-// returns true if success or false if failed.
-func write(t Format, buf []byte) (<-chan struct{}, error) {
-	var s string
-	switch t {
-	case FmtText:
-		s = "UTF8_STRING"
-	case FmtImage:
-		s = "image/png"
-	}
-
-	start := make(chan int)
-	done := make(chan struct{}, 1)
-
-	go func() { // serve as a daemon until the ownership is terminated.
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		cs := C.CString(s)
-		defer C.free(unsafe.Pointer(cs))
-
-		h := cgo.NewHandle(start)
-		var ok C.int
-		if len(buf) == 0 {
-			ok = C.clipboard_write(cs, nil, 0, C.uintptr_t(h))
-		} else {
-			ok = C.clipboard_write(cs, (*C.uchar)(unsafe.Pointer(&(buf[0]))), C.size_t(len(buf)), C.uintptr_t(h))
+func readText(tool struct {
+	name      string
+	readCmd   []string
+	writeCmd  []string
+	readImg   []string
+	writeImg  []string
+	available bool
+}) ([]byte, error) {
+	// First check if clipboard contains text
+	cmd := exec.Command(tool.readCmd[0], tool.readCmd[1:]...)
+	out, err := cmd.Output()
+	if err != nil {
+		// Check if it's because clipboard contains non-text data
+		if tool.name == "xclip" {
+			// xclip returns error when clipboard doesn't contain requested type
+			checkCmd := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o")
+			targets, _ := checkCmd.Output()
+			if bytes.Contains(targets, []byte("image/png")) && !bytes.Contains(targets, []byte("UTF8_STRING")) {
+				return nil, errUnavailable
+			}
 		}
-		if ok != C.int(0) {
-			fmt.Fprintf(os.Stderr, "write failed with status: %d\n", int(ok))
-		}
-		done <- struct{}{}
-		close(done)
-	}()
-
-	status := <-start
-	if status < 0 {
 		return nil, errUnavailable
 	}
-	// wait until enter event loop
-	return done, nil
+
+	return out, nil
+}
+
+func readImage(tool struct {
+	name      string
+	readCmd   []string
+	writeCmd  []string
+	readImg   []string
+	writeImg  []string
+	available bool
+}) ([]byte, error) {
+	if tool.name == "xsel" {
+		// xsel doesn't support image types well, return error
+		return nil, errUnavailable
+	}
+
+	cmd := exec.Command(tool.readImg[0], tool.readImg[1:]...)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, errUnavailable
+	}
+
+	// Verify it's PNG data
+	if len(out) < 8 || !bytes.Equal(out[:8], []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}) {
+		return nil, errUnavailable
+	}
+
+	return out, nil
+}
+
+func write(t Format, buf []byte) (<-chan struct{}, error) {
+	toolMutex.Lock()
+	tool := clipboardTools[selectedTool]
+	toolMutex.Unlock()
+
+	var cmd *exec.Cmd
+	switch t {
+	case FmtText:
+		if len(buf) == 0 {
+			// Write empty string
+			cmd = exec.Command(tool.writeCmd[0], tool.writeCmd[1:]...)
+			cmd.Stdin = bytes.NewReader([]byte{})
+		} else {
+			cmd = exec.Command(tool.writeCmd[0], tool.writeCmd[1:]...)
+			cmd.Stdin = bytes.NewReader(buf)
+		}
+	case FmtImage:
+		if tool.name == "xsel" {
+			// xsel doesn't support image types well
+			return nil, errUnavailable
+		}
+		if len(buf) == 0 {
+			// Clear clipboard
+			cmd = exec.Command(tool.writeCmd[0], tool.writeCmd[1:]...)
+			cmd.Stdin = bytes.NewReader([]byte{})
+		} else {
+			cmd = exec.Command(tool.writeImg[0], tool.writeImg[1:]...)
+			cmd.Stdin = bytes.NewReader(buf)
+		}
+	default:
+		return nil, errUnsupported
+	}
+
+	if err := cmd.Run(); err != nil {
+		return nil, errUnavailable
+	}
+
+	// Update change time
+	changeTimeMu.Lock()
+	lastChangeTime = time.Now()
+	currentTime := lastChangeTime
+	changeTimeMu.Unlock()
+
+	// Create change notification channel
+	changed := make(chan struct{}, 1)
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			changeTimeMu.Lock()
+			if !lastChangeTime.Equal(currentTime) {
+				changeTimeMu.Unlock()
+				changed <- struct{}{}
+				close(changed)
+				return
+			}
+			changeTimeMu.Unlock()
+		}
+	}()
+
+	return changed, nil
 }
 
 func watch(ctx context.Context, t Format) <-chan []byte {
 	recv := make(chan []byte, 1)
 	ti := time.NewTicker(time.Second)
-	last := Read(t)
+
+	// Get initial clipboard content
+	var lastContent []byte
+	if b := Read(t); b != nil {
+		lastContent = make([]byte, len(b))
+		copy(lastContent, b)
+	}
+
 	go func() {
+		defer close(recv)
+		defer ti.Stop()
+
 		for {
 			select {
 			case <-ctx.Done():
-				close(recv)
 				return
 			case <-ti.C:
 				b := Read(t)
 				if b == nil {
 					continue
 				}
-				if !bytes.Equal(last, b) {
+
+				// Check if content changed
+				if !bytes.Equal(lastContent, b) {
 					recv <- b
-					last = b
+					lastContent = make([]byte, len(b))
+					copy(lastContent, b)
 				}
 			}
 		}
@@ -164,9 +266,12 @@ func watch(ctx context.Context, t Format) <-chan []byte {
 	return recv
 }
 
-//export syncStatus
-func syncStatus(h uintptr, val int) {
-	v := cgo.Handle(h).Value().(chan int)
-	v <- val
-	cgo.Handle(h).Delete()
+// Helper function to check clipboard content type for xclip
+func getClipboardTargets() []string {
+	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Split(string(out), "\n")
 }
